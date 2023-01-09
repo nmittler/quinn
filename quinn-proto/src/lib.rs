@@ -1,3 +1,4 @@
+#![feature(type_name_of_val)]
 //! Low-level protocol logic for the QUIC protoocol
 //!
 //! quinn-proto contains a fully deterministic implementation of QUIC protocol logic. It contains
@@ -17,6 +18,8 @@
 // Fixes welcome:
 #![allow(clippy::cognitive_complexity)]
 #![allow(clippy::too_many_arguments)]
+
+extern crate core;
 
 use std::{
     fmt,

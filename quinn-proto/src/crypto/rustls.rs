@@ -39,10 +39,12 @@ impl TlsSession {
 
 impl crypto::Session for TlsSession {
     fn initial_keys(&self, dst_cid: &ConnectionId, side: Side) -> Keys {
+        println!("NM[{:?}]: initial_keys", side);
         initial_keys(self.version, dst_cid, side)
     }
 
     fn handshake_data(&self) -> Option<Box<dyn Any>> {
+        println!("NM[{:?}]: handshake_data", self.side());
         if !self.got_handshake_data {
             return None;
         }
@@ -56,17 +58,21 @@ impl crypto::Session for TlsSession {
     }
 
     fn peer_identity(&self) -> Option<Box<dyn Any>> {
+        println!("NM[{:?}]: peer_identity", self.side());
         self.inner
             .peer_certificates()
             .map(|v| -> Box<dyn Any> { Box::new(v.to_vec()) })
     }
 
     fn early_crypto(&self) -> Option<(Box<dyn HeaderKey>, Box<dyn crypto::PacketKey>)> {
+        println!("NM[{:?}]: early_crypto", self.side());
         let keys = self.inner.zero_rtt_keys()?;
+        println!("NM[{:?}]:     early_crypto: some", self.side());
         Some((Box::new(keys.header), Box::new(keys.packet)))
     }
 
     fn early_data_accepted(&self) -> Option<bool> {
+        println!("NM[{:?}]: early_data_accepted", self.side());
         match self.inner {
             Connection::Client(ref session) => Some(session.is_early_data_accepted()),
             _ => None,
@@ -74,10 +80,13 @@ impl crypto::Session for TlsSession {
     }
 
     fn is_handshaking(&self) -> bool {
-        self.inner.is_handshaking()
+        let out = self.inner.is_handshaking();
+        println!("NM[{:?}]: is_handshaking={}", self.side(), out);
+        out
     }
 
     fn read_handshake(&mut self, buf: &[u8]) -> Result<bool, TransportError> {
+        println!("NM[{:?}]: read_handshake", self.side());
         self.inner.read_hs(buf).map_err(|e| {
             if let Some(alert) = self.inner.alert() {
                 TransportError {
@@ -106,25 +115,36 @@ impl crypto::Session for TlsSession {
     }
 
     fn transport_parameters(&self) -> Result<Option<TransportParameters>, TransportError> {
-        match self.inner.quic_transport_parameters() {
-            None => Ok(None),
+        let out = match self.inner.quic_transport_parameters() {
+            None => Ok::<Option<TransportParameters>, TransportError>(None),
             Some(buf) => match TransportParameters::read(self.side(), &mut io::Cursor::new(buf)) {
                 Ok(params) => Ok(Some(params)),
                 Err(e) => Err(e.into()),
             },
-        }
+        }?;
+        println!("NM[{:?}]: transport_parameters={:?}", self.side(), out);
+        Ok(out)
     }
 
     fn write_handshake(&mut self, buf: &mut Vec<u8>) -> Option<Keys> {
-        let keys = match self.inner.write_hs(buf)? {
-            KeyChange::Handshake { keys } => keys,
-            KeyChange::OneRtt { keys, next } => {
+        println!("NM[{:?}]: write_handshake", self.side());
+        let keys = match self.inner.write_hs(buf) {
+            Some(KeyChange::Handshake { keys }) => {
+                println!("NM[{:?}]:     write_handshake: KeyChange::Handshake", self.side());
+                keys
+            },
+            Some(KeyChange::OneRtt { keys, next }) => {
+                println!("NM[{:?}]:     write_handshake: KeyChange::OneRtt", self.side());
                 self.next_secrets = Some(next);
                 keys
+            },
+            None => {
+                println!("NM[{:?}]:     write_handshake: KeyChange::None", self.side());
+                return None
             }
         };
 
-        Some(Keys {
+        let out = Some(Keys {
             header: KeyPair {
                 local: Box::new(keys.local.header),
                 remote: Box::new(keys.remote.header),
@@ -133,10 +153,12 @@ impl crypto::Session for TlsSession {
                 local: Box::new(keys.local.packet),
                 remote: Box::new(keys.remote.packet),
             },
-        })
+        });
+        out
     }
 
     fn next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn crypto::PacketKey>>> {
+        println!("NM[{:?}]: next_1rtt_keys", self.side());
         let secrets = self.next_secrets.as_mut()?;
         let keys = secrets.next_packet_keys();
         Some(KeyPair {
@@ -146,6 +168,7 @@ impl crypto::Session for TlsSession {
     }
 
     fn is_valid_retry(&self, orig_dst_cid: &ConnectionId, header: &[u8], payload: &[u8]) -> bool {
+        println!("NM[{:?}]: is_valid_retry", self.side());
         let tag_start = match payload.len().checked_sub(16) {
             Some(x) => x,
             None => return false,
@@ -178,6 +201,7 @@ impl crypto::Session for TlsSession {
         label: &[u8],
         context: &[u8],
     ) -> Result<(), ExportKeyingMaterialError> {
+        println!("NM[{:?}]: export_keyring_material", self.side());
         self.inner
             .export_keying_material(output, label, Some(context))
             .map_err(|_| ExportKeyingMaterialError)
@@ -265,6 +289,10 @@ impl crypto::ClientConfig for rustls::ClientConfig {
             ),
         }))
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 impl crypto::ServerConfig for rustls::ServerConfig {
@@ -315,7 +343,12 @@ impl crypto::ServerConfig for rustls::ServerConfig {
             .unwrap();
         let mut result = [0; 16];
         result.copy_from_slice(tag.as_ref());
+        println!("NM: retry tag={:02x?}", result);
         result
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

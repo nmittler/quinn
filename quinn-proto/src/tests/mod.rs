@@ -8,8 +8,6 @@ use std::{
 use assert_matches::assert_matches;
 use bytes::Bytes;
 use hex_literal::hex;
-use rand::RngCore;
-use ring::hmac;
 use rustls::internal::msgs::enums::AlertDescription;
 use tracing::info;
 
@@ -20,12 +18,22 @@ use crate::{
 };
 mod util;
 use util::*;
+use yare::parameterized;
 
 #[test]
-fn version_negotiate_server() {
+fn ide_marker_() {}
+
+#[parameterized(
+    rustls = { Provider::Rustls },
+    boring = { Provider::Boring },
+)]
+fn version_negotiate_server(sprovider: Provider) {
     let _guard = subscribe();
     let client_addr = "[::2]:7890".parse().unwrap();
-    let mut server = Endpoint::new(Default::default(), Some(Arc::new(server_config())));
+
+    let server_config = sprovider.server_config();
+    //let server_config = ServerConfig::with_crypto(sprovider.server_crypto(ServerParams::default()));
+    let mut server = Endpoint::new(Default::default(), Some(Arc::new(server_config)));
     let now = Instant::now();
     let event = server.handle(
         now,
@@ -49,8 +57,12 @@ fn version_negotiate_server() {
     assert_matches!(server.poll_transmit(), None);
 }
 
-#[test]
+#[parameterized(
+    rustls = { Provider::Rustls },
+    boring = { Provider::Boring },
+)]
 fn version_negotiate_client() {
+    let cprovider = Provider::Boring;
     let _guard = subscribe();
     let server_addr = "[::2]:7890".parse().unwrap();
     let cid_generator_factory: fn() -> Box<dyn ConnectionIdGenerator> =
@@ -62,8 +74,10 @@ fn version_negotiate_client() {
         }),
         None,
     );
+    let client_config = cprovider.client_config();
+    //let client_config = ClientConfig::new(cprovider.client_crypto(ClientParams::default()));
     let (_, mut client_ch) = client
-        .connect(client_config(), server_addr, "localhost")
+        .connect(client_config, server_addr, "localhost")
         .unwrap();
     let now = Instant::now();
     let opt_event = client.handle(
@@ -89,11 +103,18 @@ fn version_negotiate_client() {
     );
 }
 
-#[test]
-fn lifecycle() {
+#[parameterized(
+    rustls = { Provider::Rustls, Provider::Rustls },
+    boring = { Provider::Boring, Provider::Boring },
+    rustls_to_boring = { Provider::Rustls, Provider::Boring },
+    boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn lifecycle(cprovider: Provider, sprovider: Provider) {
+    // let cprovider = Provider::Boring;
+    // let sprovider = Provider::Rustls;
     let _guard = subscribe();
-    let mut pair = Pair::default();
-    let (client_ch, server_ch) = pair.connect();
+    let mut pair = Pair::for_provider(sprovider);
+    let (client_ch, server_ch) = pair.connect(cprovider);
     assert_matches!(pair.client_conn_mut(client_ch).poll(), None);
     assert!(pair.client_conn_mut(client_ch).using_ecn());
     assert!(pair.server_conn_mut(server_ch).using_ecn());
@@ -117,14 +138,21 @@ fn lifecycle() {
     assert_eq!(pair.server.known_cids(), 0);
 }
 
-#[test]
-fn draft_version_compat() {
+#[parameterized(
+    rustls = { Provider::Rustls, Provider::Rustls },
+    boring = { Provider::Boring, Provider::Boring },
+    rustls_to_boring = { Provider::Rustls, Provider::Boring },
+    boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn draft_version_compat(cprovider: Provider, sprovider: Provider) {
+    // let cprovider = Provider::Boring;
+    // let sprovider = Provider::Boring;
     let _guard = subscribe();
-
-    let mut client_config = client_config();
+    let mut client_config = cprovider.client_config();
+    //let mut client_config = ClientConfig::new(cprovider.client_crypto(ClientParams::default()));
     client_config.version(0xff00_0020);
 
-    let mut pair = Pair::default();
+    let mut pair = Pair::for_provider(sprovider);
     let (client_ch, server_ch) = pair.connect_with(client_config);
 
     assert_matches!(pair.client_conn_mut(client_ch).poll(), None);
@@ -150,33 +178,42 @@ fn draft_version_compat() {
     assert_eq!(pair.server.known_cids(), 0);
 }
 
-#[test]
-fn stateless_retry() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn stateless_retry(cprovider: Provider, sprovider: Provider) {
+    // let cprovider = Provider::Boring;
+    // let sprovider = Provider::Boring;
     let _guard = subscribe();
     let mut pair = Pair::new(
         Default::default(),
-        ServerConfig {
+        Arc::new(ServerConfig {
             use_retry: true,
-            ..server_config()
-        },
+            ..sprovider.server_config()
+        }),
     );
-    pair.connect();
+    pair.connect(cprovider);
 }
 
-#[test]
-fn server_stateless_reset() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn server_stateless_reset(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
-    let mut reset_key = vec![0; 64];
-    let mut rng = rand::thread_rng();
-    rng.fill_bytes(&mut reset_key);
-    let reset_key = hmac::Key::new(hmac::HMAC_SHA256, &reset_key);
 
-    let endpoint_config = Arc::new(EndpointConfig::new(Arc::new(reset_key)));
+    let endpoint_config = Arc::new(EndpointConfig::new(sprovider.hmac_key()));
 
-    let mut pair = Pair::new(endpoint_config.clone(), server_config());
-    let (client_ch, _) = pair.connect();
+    let mut pair = Pair::new(endpoint_config.clone(), Arc::new(sprovider.server_config()));
+    let (client_ch, _) = pair.connect(cprovider);
     pair.drive(); // Flush any post-handshake frames
-    pair.server.endpoint = Endpoint::new(endpoint_config, Some(Arc::new(server_config())));
+    pair.server.endpoint =
+        Endpoint::new(endpoint_config, Some(Arc::new(sprovider.server_config())));
     // Force the server to generate the smallest possible stateless reset
     pair.client.connections.get_mut(&client_ch).unwrap().ping();
     info!("resetting");
@@ -189,19 +226,21 @@ fn server_stateless_reset() {
     );
 }
 
-#[test]
-fn client_stateless_reset() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn client_stateless_reset(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
-    let mut reset_key = vec![0; 64];
-    let mut rng = rand::thread_rng();
-    rng.fill_bytes(&mut reset_key);
-    let reset_key = hmac::Key::new(hmac::HMAC_SHA256, &reset_key);
 
-    let endpoint_config = Arc::new(EndpointConfig::new(Arc::new(reset_key)));
+    let endpoint_config = Arc::new(EndpointConfig::new(sprovider.hmac_key()));
 
-    let mut pair = Pair::new(endpoint_config.clone(), server_config());
-    let (_, server_ch) = pair.connect();
-    pair.client.endpoint = Endpoint::new(endpoint_config, Some(Arc::new(server_config())));
+    let mut pair = Pair::new(endpoint_config.clone(), Arc::new(sprovider.server_config()));
+    let (_, server_ch) = pair.connect(cprovider);
+    pair.client.endpoint =
+        Endpoint::new(endpoint_config, Some(Arc::new(sprovider.server_config())));
     // Send something big enough to allow room for a smaller stateless reset.
     pair.server.connections.get_mut(&server_ch).unwrap().close(
         pair.time,
@@ -218,11 +257,14 @@ fn client_stateless_reset() {
     );
 }
 
-#[test]
-fn export_keying_material() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+)]
+fn export_keying_material(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
-    let mut pair = Pair::default();
-    let (client_ch, server_ch) = pair.connect();
+    let mut pair = Pair::for_provider(sprovider);
+    let (client_ch, server_ch) = pair.connect(cprovider);
 
     const LABEL: &[u8] = b"test_label";
     const CONTEXT: &[u8] = b"test_context";
@@ -244,11 +286,16 @@ fn export_keying_material() {
     assert_eq!(&client_buf[..], &server_buf[..]);
 }
 
-#[test]
-fn finish_stream_simple() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn finish_stream_simple(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
-    let mut pair = Pair::default();
-    let (client_ch, server_ch) = pair.connect();
+    let mut pair = Pair::for_provider(sprovider);
+    let (client_ch, server_ch) = pair.connect(cprovider);
 
     let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
 
@@ -284,11 +331,16 @@ fn finish_stream_simple() {
     let _ = chunks.finalize();
 }
 
-#[test]
-fn reset_stream() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn reset_stream(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
-    let mut pair = Pair::default();
-    let (client_ch, server_ch) = pair.connect();
+    let mut pair = Pair::for_provider(sprovider);
+    let (client_ch, server_ch) = pair.connect(cprovider);
 
     let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
 
@@ -313,11 +365,16 @@ fn reset_stream() {
     assert_matches!(pair.client_conn_mut(client_ch).poll(), None);
 }
 
-#[test]
-fn stop_stream() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn stop_stream(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
-    let mut pair = Pair::default();
-    let (client_ch, server_ch) = pair.connect();
+    let mut pair = Pair::for_provider(sprovider);
+    let (client_ch, server_ch) = pair.connect(cprovider);
 
     let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
     const MSG: &[u8] = b"hello";
@@ -345,43 +402,97 @@ fn stop_stream() {
     );
 }
 
-#[test]
-fn reject_self_signed_server_cert() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn reject_self_signed_server_cert(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
-    let mut pair = Pair::default();
+    let mut pair = Pair::for_provider(sprovider);
     info!("connecting");
-    let client_ch = pair.begin_connect(client_config_with_certs(vec![]));
+    let client_ch = pair.begin_connect(cprovider.client_config_with_cert(vec![]));
     pair.drive();
     assert_matches!(pair.client_conn_mut(client_ch).poll(),
-                    Some(Event::ConnectionLost { reason: ConnectionError::TransportError(ref error)})
-                    if error.code == TransportErrorCode::crypto(AlertDescription::BadCertificate.get_u8()));
+                Some(Event::ConnectionLost { reason: ConnectionError::TransportError(ref error)}) => {
+        assert!(
+            // Boring and Rustls return different values here.
+            error.code == TransportErrorCode::crypto(AlertDescription::BadCertificate.get_u8()) ||
+            error.code == TransportErrorCode::crypto(AlertDescription::UnknownCA.get_u8())
+            );
+    });
 }
 
-#[test]
-fn reject_missing_client_cert() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn client_auth(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
 
-    let key = rustls::PrivateKey(CERTIFICATE.serialize_private_key_der());
-    let cert = util::CERTIFICATE.serialize_der().unwrap();
+    let client_config = ClientConfig::new(Arc::from(cprovider.client_crypto(ClientParams {
+        // Don't present the client certificate to the server.
+        enable_client_auth: true,
+        ..ClientParams::default()
+    })));
+    let server_config = ServerConfig::with_crypto(Arc::from(sprovider.server_crypto(ServerParams {
+        // Require that a client certificate be present and valid.
+        enable_client_auth: true,
+        ..ServerParams::default()
+    })));
 
-    let config = rustls::ServerConfig::builder()
-        .with_safe_default_cipher_suites()
-        .with_safe_default_kx_groups()
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_client_cert_verifier(rustls::server::AllowAnyAuthenticatedClient::new(
-            rustls::RootCertStore::empty(),
-        ))
-        .with_single_cert(vec![rustls::Certificate(cert)], key)
-        .unwrap();
+    let mut pair = Pair::new(Default::default(), Arc::new(server_config));
+    let (client_ch, server_ch) = pair.connect_with(client_config);
+    assert_matches!(pair.client_conn_mut(client_ch).poll(), None);
+    assert!(pair.client_conn_mut(client_ch).using_ecn());
+    assert!(pair.server_conn_mut(server_ch).using_ecn());
 
-    let mut pair = Pair::new(
-        Default::default(),
-        ServerConfig::with_crypto(Arc::new(config)),
+    const REASON: &[u8] = b"whee";
+    info!("closing");
+    pair.client.connections.get_mut(&client_ch).unwrap().close(
+        pair.time,
+        VarInt(42),
+        REASON.into(),
     );
+    pair.drive();
+    assert_matches!(pair.server_conn_mut(server_ch).poll(),
+                    Some(Event::ConnectionLost { reason: ConnectionError::ApplicationClosed(
+                        ApplicationClose { error_code: VarInt(42), ref reason }
+                    )}) if reason == REASON);
+    assert_matches!(pair.client_conn_mut(client_ch).poll(), None);
+    assert_eq!(pair.client.known_connections(), 0);
+    assert_eq!(pair.client.known_cids(), 0);
+    assert_eq!(pair.server.known_connections(), 0);
+    assert_eq!(pair.server.known_cids(), 0);
+}
+
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn reject_missing_client_cert(cprovider: Provider, sprovider: Provider) {
+    let _guard = subscribe();
+
+    let client_config = ClientConfig::new(Arc::from(cprovider.client_crypto(ClientParams {
+        // Don't present the client certificate to the server.
+        enable_client_auth: false,
+        ..ClientParams::default()
+    })));
+    let server_config = ServerConfig::with_crypto(Arc::from(sprovider.server_crypto(ServerParams {
+        // Require that a client certificate be present and valid.
+        enable_client_auth: true,
+        ..ServerParams::default()
+    })));
+
+    let mut pair = Pair::new(Default::default(), Arc::new(server_config));
 
     info!("connecting");
-    let client_ch = pair.begin_connect(client_config());
+    let client_ch = pair.begin_connect(client_config);
     pair.drive();
 
     // The client completes the connection, but finds it immediately closed
@@ -408,11 +519,87 @@ fn reject_missing_client_cert() {
                     if error.code == TransportErrorCode::crypto(AlertDescription::CertificateRequired.get_u8()));
 }
 
-#[test]
-fn congestion() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn reject_unknown_client_cert(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
-    let mut pair = Pair::default();
-    let (client_ch, _) = pair.connect();
+
+    let client_config = ClientConfig::new(Arc::from(cprovider.client_crypto(ClientParams {
+        // Don't present the client certificate to the server.
+        enable_client_auth: true,
+        cert_chain: UNTRUSTED_CERT.cert_chain(),
+        key: UNTRUSTED_CERT.key(),
+        ..ClientParams::default()
+    })));
+    let server_config = ServerConfig::with_crypto(Arc::from(sprovider.server_crypto(ServerParams {
+        // Require that a client certificate be present and valid.
+        enable_client_auth: true,
+        ..ServerParams::default()
+    })));
+
+    let mut pair = Pair::new(Default::default(), Arc::new(server_config));
+
+    info!("connecting");
+    let client_ch = pair.begin_connect(client_config);
+    pair.drive();
+
+    // The client completes the connection, but finds it immediately closed
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::HandshakeDataReady)
+    );
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::Connected)
+    );
+    assert_matches!(pair.client_conn_mut(client_ch).poll(),
+                    Some(Event::ConnectionLost { reason: ConnectionError::ConnectionClosed(ref close)}) => {
+            println!("NM: client closed with code={}, reason={:?}", close.error_code, close.reason);
+            assert!(
+                // BoringSSL behavior.
+                close.error_code == TransportErrorCode::crypto(AlertDescription::UnknownCA.get_u8()) ||
+
+                // Rustls behavior.
+                (close.error_code == TransportErrorCode::crypto(AlertDescription::HandshakeFailure.get_u8())
+                    && String::from_utf8(close.reason.to_vec()).unwrap().contains("UnknownIssuer"))
+            );
+
+    });
+
+    // The server never completes the connection
+    let server_ch = pair.server.assert_accept();
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::HandshakeDataReady)
+    );
+    assert_matches!(pair.server_conn_mut(server_ch).poll(),
+                    Some(Event::ConnectionLost { reason: ConnectionError::TransportError(ref error)}) => {
+            println!("NM: server closed with code={}, reason={:?}", error.code, error.reason);
+            assert!(
+                // BoringSSL behavior.
+                error.code == TransportErrorCode::crypto(AlertDescription::UnknownCA.get_u8()) ||
+
+                // Rustls behavior.
+                (error.code == TransportErrorCode::crypto(AlertDescription::HandshakeFailure.get_u8())
+                    && error.reason.contains("UnknownIssuer"))
+            );
+    });
+}
+
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn congestion(cprovider: Provider, sprovider: Provider) {
+    let _guard = subscribe();
+    let mut pair = Pair::for_provider(sprovider);
+    let (client_ch, _) = pair.connect(cprovider);
 
     const TARGET: u64 = 2048;
     assert!(pair.client_conn_mut(client_ch).congestion_window() > TARGET);
@@ -430,29 +617,45 @@ fn congestion() {
 }
 
 #[allow(clippy::field_reassign_with_default)] // https://github.com/rust-lang/rust-clippy/issues/6527
-#[test]
-fn high_latency_handshake() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn high_latency_handshake(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
-    let mut pair = Pair::default();
+    let mut pair = Pair::for_provider(sprovider);
     pair.latency = Duration::from_micros(200 * 1000);
-    let (client_ch, server_ch) = pair.connect();
+    let (client_ch, server_ch) = pair.connect(cprovider);
     assert_eq!(pair.client_conn_mut(client_ch).bytes_in_flight(), 0);
     assert_eq!(pair.server_conn_mut(server_ch).bytes_in_flight(), 0);
     assert!(pair.client_conn_mut(client_ch).using_ecn());
     assert!(pair.server_conn_mut(server_ch).using_ecn());
 }
 
-#[test]
-fn zero_rtt_happypath() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn zero_rtt_happypath(cprovider: Provider, sprovider: Provider) {
+    // let cprovider = Provider::Boring;
+    // let sprovider = Provider::Rustls;
     let _guard = subscribe();
     let mut pair = Pair::new(
         Default::default(),
-        ServerConfig {
+        Arc::new(ServerConfig {
             use_retry: true,
-            ..server_config()
-        },
+            ..sprovider.server_config()
+        }),
     );
-    let config = client_config();
+    let crypto_config = cprovider.client_crypto(ClientParams::default());
+    let crypto_config2 = cprovider.client_crypto_reuse_session(ClientParams::default(), &crypto_config);
+    let config = ClientConfig::new(Arc::from(crypto_config));
+    let config2 = ClientConfig::new(Arc::from(crypto_config2));
+    //let config = cprovider.client_config();
 
     // Establish normal connection
     let client_ch = pair.begin_connect(config.clone());
@@ -470,7 +673,7 @@ fn zero_rtt_happypath() {
         CLIENT_PORTS.lock().unwrap().next().unwrap(),
     );
     info!("resuming session");
-    let client_ch = pair.begin_connect(config);
+    let client_ch = pair.begin_connect(config2);
     assert!(pair.client_conn_mut(client_ch).has_0rtt());
     let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
     const MSG: &[u8] = b"Hello, 0-RTT!";
@@ -513,16 +716,55 @@ fn zero_rtt_happypath() {
     assert_eq!(pair.client_conn_mut(client_ch).lost_packets(), 0);
 }
 
-#[test]
-fn zero_rtt_rejection() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn zero_rtt_rejection(cprovider: Provider, sprovider: Provider) {
+    // let cprovider = Provider::Boring;
+    // let sprovider = Provider::Rustls;
     let _guard = subscribe();
-    let mut server_crypto = server_crypto();
-    server_crypto.alpn_protocols = vec!["foo".into(), "bar".into()];
-    let server_config = ServerConfig::with_crypto(Arc::new(server_crypto));
-    let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
-    let mut client_crypto = client_crypto();
-    client_crypto.alpn_protocols = vec!["foo".into()];
-    let client_config = ClientConfig::new(Arc::new(client_crypto.clone()));
+
+    // Share the client-side session cache across the 1st and resumed connections.
+    let client_crypto = cprovider.client_crypto(ClientParams::default());
+    let client_crypto_resumed = cprovider.client_crypto_reuse_session(ClientParams::default(), &client_crypto);
+    let client_config = ClientConfig::new(Arc::from(client_crypto));
+    let client_config_resumed = ClientConfig::new(Arc::from(client_crypto_resumed));
+
+    // Use separate servers for the 1st and resumed connections so that the resumed server will not
+    // have any cached sessions. This will cause the 0-RTT attempt to be rejected.
+    let server_config = sprovider.server_config();
+    let server_config_resumed = sprovider.server_config();
+
+    // let mut server_crypto = sprovider.server_crypto(ServerParams::default());
+    // let mut server_crypto_resumed = sprovider.server_crypto(ServerParams::default());
+    //let mut server_crypto_resumed = sprovider.server_crypto_reuse_session(ServerParams::default(), &server_crypto);
+    // let mut server_config = Arc::new(sprovider.server_config());
+    // let mut server_config_resumed = Arc::new(sprovider.server_config());
+    // let mut server_config = Arc::new(ServerConfig::with_crypto(Arc::from(server_crypto)));
+    // let mut server_config_resumed = Arc::new(ServerConfig::with_crypto(Arc::from(server_crypto_resumed)));
+    let mut pair = Pair::new(Arc::new(EndpointConfig::default()), Arc::new(server_config));
+
+    // let client_crypto = cprovider.client_crypto(ClientParams {
+    //     //alpn_protocols: vec!["foo".into()],
+    //     ..ClientParams::default()
+    // });
+    // let mut client_crypto_resumed = cprovider.client_crypto_reuse_session(ClientParams {
+    //     //alpn_protocols: vec!["bar".into()],
+    //     ..ClientParams::default()
+    // }, &client_crypto);
+    //cprovider.set_alpn_protocols(&mut client_crypto_resumed, vec!["bar".into()]);
+
+    // let mut client_crypto = client_crypto_rustls(ClientParams {
+    //     alpn_protocols: vec!["foo".into()],
+    //     ..ClientParams::default()
+    // });
+    // let client_config = ClientConfig::new(Arc::from(client_crypto));
+    // let client_config_resumed = ClientConfig::new(Arc::from(client_crypto_resumed));
+    // let client_config = cprovider.client_config();
+    // let client_config_resumed = client_config.clone();
 
     // Establish normal connection
     let client_ch = pair.begin_connect(client_config);
@@ -551,11 +793,25 @@ fn zero_rtt_rejection() {
     pair.client.connections.clear();
     pair.server.connections.clear();
 
-    // Changing protocols invalidates 0-RTT
-    client_crypto.alpn_protocols = vec!["bar".into()];
-    let client_config = ClientConfig::new(Arc::new(client_crypto));
     info!("resuming session");
-    let client_ch = pair.begin_connect(client_config);
+    //sprovider.clear_session_cache(server_config.crypto.clone());
+    //sprovider.clear_session_cache(server_config.crypto.clone());
+    // Changing protocols invalidates 0-RTT
+    //cprovider.set_alpn_protocols(&mut client_crypto_resumed, vec!["bar".into()]);
+
+    //let mut server_config_resumed = sprovider.server_config();
+    // let mut transport = TransportConfig::default();
+    // transport.max_concurrent_bidi_streams.0 = 1;
+    // server_config_resumed.transport = Arc::new(transport);
+
+    //let server_config = sprovider.server_config();
+    let mut pair = Pair::new(Arc::new(EndpointConfig::default()), Arc::new(server_config_resumed));
+
+    //client_crypto_resumed.alpn_protocols = vec!["bar".into()];
+    //let client_config_resumed = ClientConfig::new(Arc::from(client_crypto_resumed));
+    //let client_config = Arc::from(client_config.clone());
+
+    let client_ch = pair.begin_connect(client_config_resumed);
     assert!(pair.client_conn_mut(client_ch).has_0rtt());
     let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
     const MSG: &[u8] = b"Hello, 0-RTT!";
@@ -582,16 +838,22 @@ fn zero_rtt_rejection() {
     assert_eq!(pair.client_conn_mut(client_ch).lost_packets(), 0);
 }
 
-#[test]
-fn alpn_success() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn alpn_success(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
-    let mut server_crypto = server_crypto();
-    server_crypto.alpn_protocols = vec!["foo".into(), "bar".into(), "baz".into()];
-    let server_config = ServerConfig::with_crypto(Arc::new(server_crypto));
-    let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
-    let mut client_crypto = client_crypto();
-    client_crypto.alpn_protocols = vec!["bar".into(), "quux".into(), "corge".into()];
-    let client_config = ClientConfig::new(Arc::new(client_crypto));
+    let server_config =
+        sprovider.server_config_with_alpn_protocols(vec!["foo".into(), "bar".into(), "baz".into()]);
+    let client_config = cprovider.client_config_with_alpn_protocols(vec![
+        "bar".into(),
+        "quux".into(),
+        "corge".into(),
+    ]);
+    let mut pair = Pair::new(Arc::new(EndpointConfig::default()), Arc::new(server_config));
 
     // Establish normal connection
     let client_ch = pair.begin_connect(client_config);
@@ -606,24 +868,28 @@ fn alpn_success() {
         Some(Event::Connected)
     );
 
-    let hd = pair
-        .client_conn_mut(client_ch)
-        .crypto_session()
-        .handshake_data()
-        .unwrap()
-        .downcast::<crate::crypto::rustls::HandshakeData>()
-        .unwrap();
-    assert_eq!(hd.protocol.unwrap(), &b"bar"[..]);
+    let protocol = cprovider.get_selected_alpn_protocol(
+        pair.client_conn_mut(client_ch)
+            .crypto_session()
+            .handshake_data(),
+    );
+    assert_eq!(protocol, &b"bar"[..]);
 }
 
-#[test]
-fn server_alpn_unset() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn server_alpn_unset(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
-    let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config());
+    let mut pair = Pair::new(
+        Arc::new(EndpointConfig::default()),
+        Arc::new(sprovider.server_config_with_alpn_protocols(vec![])),
+    );
 
-    let mut client_crypto = client_crypto();
-    client_crypto.alpn_protocols = vec!["foo".into()];
-    let client_config = ClientConfig::new(Arc::new(client_crypto));
+    let client_config = cprovider.client_config_with_alpn_protocols(vec!["foo".into()]);
 
     let client_ch = pair.begin_connect(client_config);
     pair.drive();
@@ -633,15 +899,17 @@ fn server_alpn_unset() {
     );
 }
 
-#[test]
-fn client_alpn_unset() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+)]
+fn client_alpn_unset(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
-    let mut server_crypto = server_crypto();
-    server_crypto.alpn_protocols = vec!["foo".into(), "bar".into(), "baz".into()];
-    let server_config = ServerConfig::with_crypto(Arc::new(server_crypto));
-    let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
+    let server_config =
+        sprovider.server_config_with_alpn_protocols(vec!["foo".into()]);
+    let mut pair = Pair::new(Arc::new(EndpointConfig::default()), Arc::new(server_config));
 
-    let client_ch = pair.begin_connect(client_config());
+    let client_ch = pair.begin_connect(cprovider.client_config_with_alpn_protocols(vec![]));
     pair.drive();
     assert_matches!(
         pair.client_conn_mut(client_ch).poll(),
@@ -649,17 +917,20 @@ fn client_alpn_unset() {
     );
 }
 
-#[test]
-fn alpn_mismatch() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn alpn_mismatch(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
-    let mut server_crypto = server_crypto();
-    server_crypto.alpn_protocols = vec!["foo".into(), "bar".into(), "baz".into()];
-    let server_config = ServerConfig::with_crypto(Arc::new(server_crypto));
-    let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
+    let server_config =
+        sprovider.server_config_with_alpn_protocols(vec!["foo".into(), "bar".into(), "baz".into()]);
+    let mut pair = Pair::new(Arc::new(EndpointConfig::default()), Arc::new(server_config));
 
-    let mut client_crypto = client_crypto();
-    client_crypto.alpn_protocols = vec!["quux".into(), "corge".into()];
-    let client_config = ClientConfig::new(Arc::new(client_crypto));
+    let client_config =
+        cprovider.client_config_with_alpn_protocols(vec!["quux".into(), "corge".into()]);
 
     let client_ch = pair.begin_connect(client_config);
     pair.drive();
@@ -669,18 +940,23 @@ fn alpn_mismatch() {
     );
 }
 
-#[test]
-fn stream_id_limit() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn stream_id_limit(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
     let server = ServerConfig {
         transport: Arc::new(TransportConfig {
             max_concurrent_uni_streams: 1u32.into(),
             ..TransportConfig::default()
         }),
-        ..server_config()
+        ..sprovider.server_config()
     };
-    let mut pair = Pair::new(Default::default(), server);
-    let (client_ch, server_ch) = pair.connect();
+    let mut pair = Pair::new(Default::default(), Arc::new(server));
+    let (client_ch, server_ch) = pair.connect(cprovider);
 
     let s = pair
         .client
@@ -757,11 +1033,16 @@ fn stream_id_limit() {
     let _ = chunks.finalize();
 }
 
-#[test]
-fn key_update_simple() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn key_update_simple(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
-    let mut pair = Pair::default();
-    let (client_ch, server_ch) = pair.connect();
+    let mut pair = Pair::for_provider(sprovider);
+    let (client_ch, server_ch) = pair.connect(cprovider);
     let s = pair
         .client
         .connections
@@ -810,11 +1091,16 @@ fn key_update_simple() {
     assert_eq!(pair.server_conn_mut(server_ch).lost_packets(), 0);
 }
 
-#[test]
-fn key_update_reordered() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn key_update_reordered(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
-    let mut pair = Pair::default();
-    let (client_ch, server_ch) = pair.connect();
+    let mut pair = Pair::for_provider(sprovider);
+    let (client_ch, server_ch) = pair.connect(cprovider);
     let s = pair
         .client
         .connections
@@ -858,11 +1144,16 @@ fn key_update_reordered() {
     assert_eq!(pair.server_conn_mut(server_ch).lost_packets(), 0);
 }
 
-#[test]
-fn initial_retransmit() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn initial_retransmit(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
-    let mut pair = Pair::default();
-    let client_ch = pair.begin_connect(client_config());
+    let mut pair = Pair::for_provider(sprovider);
+    let client_ch = pair.begin_connect(cprovider.client_config());
     pair.client.drive(pair.time, pair.server.addr);
     pair.client.outbound.clear(); // Drop initial
     pair.drive();
@@ -876,12 +1167,20 @@ fn initial_retransmit() {
     );
 }
 
-#[test]
-fn instant_close_1() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+//#[test]
+fn instant_close_1(cprovider: Provider, sprovider: Provider) {
+    // let cprovider = Provider::Boring;
+    // let sprovider = Provider::Boring;
     let _guard = subscribe();
-    let mut pair = Pair::default();
+    let mut pair = Pair::for_provider(sprovider);
     info!("connecting");
-    let client_ch = pair.begin_connect(client_config());
+    let client_ch = pair.begin_connect(cprovider.client_config());
     pair.client
         .connections
         .get_mut(&client_ch)
@@ -901,12 +1200,17 @@ fn instant_close_1() {
     );
 }
 
-#[test]
-fn instant_close_2() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn instant_close_2(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
-    let mut pair = Pair::default();
+    let mut pair = Pair::for_provider(sprovider);
     info!("connecting");
-    let client_ch = pair.begin_connect(client_config());
+    let client_ch = pair.begin_connect(cprovider.client_config());
     // Unlike `instant_close`, the server sees a valid Initial packet first.
     pair.drive_client();
     pair.client
@@ -932,8 +1236,13 @@ fn instant_close_2() {
     );
 }
 
-#[test]
-fn idle_timeout() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn idle_timeout(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
     const IDLE_TIMEOUT: u64 = 100;
     let server = ServerConfig {
@@ -941,10 +1250,10 @@ fn idle_timeout() {
             max_idle_timeout: Some(VarInt(IDLE_TIMEOUT)),
             ..TransportConfig::default()
         }),
-        ..server_config()
+        ..sprovider.server_config()
     };
-    let mut pair = Pair::new(Default::default(), server);
-    let (client_ch, server_ch) = pair.connect();
+    let mut pair = Pair::new(Default::default(), Arc::new(server));
+    let (client_ch, server_ch) = pair.connect(cprovider);
     pair.client_conn_mut(client_ch).ping();
     let start = pair.time;
 
@@ -974,11 +1283,16 @@ fn idle_timeout() {
     );
 }
 
-#[test]
-fn connection_close_sends_acks() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn connection_close_sends_acks(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
-    let mut pair = Pair::default();
-    let (client_ch, _server_ch) = pair.connect();
+    let mut pair = Pair::for_provider(sprovider);
+    let (client_ch, _server_ch) = pair.connect(cprovider);
 
     let client_acks = pair.client_conn_mut(client_ch).stats().frame_rx.acks;
 
@@ -998,17 +1312,22 @@ fn connection_close_sends_acks() {
     );
 }
 
-#[test]
-fn concurrent_connections_full() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn concurrent_connections_full(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
     let mut pair = Pair::new(
         Default::default(),
-        ServerConfig {
+        Arc::new(ServerConfig {
             concurrent_connections: 0,
-            ..server_config()
-        },
+            ..sprovider.server_config()
+        }),
     );
-    let client_ch = pair.begin_connect(client_config());
+    let client_ch = pair.begin_connect(cprovider.client_config());
     pair.drive();
     assert_matches!(
         pair.client_conn_mut(client_ch).poll(),
@@ -1024,11 +1343,16 @@ fn concurrent_connections_full() {
     assert_eq!(pair.server.known_cids(), 0);
 }
 
-#[test]
-fn server_hs_retransmit() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn server_hs_retransmit(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
-    let mut pair = Pair::default();
-    let client_ch = pair.begin_connect(client_config());
+    let mut pair = Pair::for_provider(sprovider);
+    let client_ch = pair.begin_connect(cprovider.client_config());
     pair.step();
     assert!(!pair.client.inbound.is_empty()); // Initial + Handshakes
     pair.client.inbound.clear();
@@ -1043,11 +1367,16 @@ fn server_hs_retransmit() {
     );
 }
 
-#[test]
-fn migration() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn migration(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
-    let mut pair = Pair::default();
-    let (client_ch, server_ch) = pair.connect();
+    let mut pair = Pair::for_provider(sprovider);
+    let (client_ch, server_ch) = pair.connect(cprovider);
     pair.client.addr = SocketAddr::new(
         Ipv4Addr::new(127, 0, 0, 1).into(),
         CLIENT_PORTS.lock().unwrap().next().unwrap(),
@@ -1068,16 +1397,21 @@ fn migration() {
     );
 }
 
-fn test_flow_control(config: TransportConfig, window_size: usize) {
+fn test_flow_control(
+    cprovider: Provider,
+    sprovider: Provider,
+    config: TransportConfig,
+    window_size: usize,
+) {
     let _guard = subscribe();
     let mut pair = Pair::new(
         Default::default(),
-        ServerConfig {
+        Arc::new(ServerConfig {
             transport: Arc::new(config),
-            ..server_config()
-        },
+            ..sprovider.server_config()
+        }),
     );
-    let (client_ch, server_ch) = pair.connect();
+    let (client_ch, server_ch) = pair.connect(cprovider);
     let msg = vec![0xAB; window_size + 10];
 
     // Stream reset before read
@@ -1167,9 +1501,16 @@ fn test_flow_control(config: TransportConfig, window_size: usize) {
     info!("finished reading");
 }
 
-#[test]
-fn stream_flow_control() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn stream_flow_control(cprovider: Provider, sprovider: Provider) {
     test_flow_control(
+        cprovider,
+        sprovider,
         TransportConfig {
             stream_receive_window: 2000u32.into(),
             ..TransportConfig::default()
@@ -1178,9 +1519,16 @@ fn stream_flow_control() {
     );
 }
 
-#[test]
-fn conn_flow_control() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn conn_flow_control(cprovider: Provider, sprovider: Provider) {
     test_flow_control(
+        cprovider,
+        sprovider,
         TransportConfig {
             receive_window: 2000u32.into(),
             ..TransportConfig::default()
@@ -1189,11 +1537,16 @@ fn conn_flow_control() {
     );
 }
 
-#[test]
-fn stop_opens_bidi() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn stop_opens_bidi(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
-    let mut pair = Pair::default();
-    let (client_ch, server_ch) = pair.connect();
+    let mut pair = Pair::for_provider(sprovider);
+    let (client_ch, server_ch) = pair.connect(cprovider);
     assert_eq!(pair.client_streams(client_ch).send_streams(), 0);
     let s = pair.client_streams(client_ch).open(Dir::Bi).unwrap();
     assert_eq!(pair.client_streams(client_ch).send_streams(), 1);
@@ -1234,11 +1587,16 @@ fn stop_opens_bidi() {
     assert_matches!(pair.server_conn_mut(server_ch).poll(), None);
 }
 
-#[test]
-fn implicit_open() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn implicit_open(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
-    let mut pair = Pair::default();
-    let (client_ch, server_ch) = pair.connect();
+    let mut pair = Pair::for_provider(sprovider);
+    let (client_ch, server_ch) = pair.connect(cprovider);
     let s1 = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
     let s2 = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
     pair.client_send(client_ch, s2).write(b"hello").unwrap();
@@ -1252,8 +1610,13 @@ fn implicit_open() {
     assert_eq!(pair.server_streams(server_ch).accept(Dir::Uni), None);
 }
 
-#[test]
-fn zero_length_cid() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn zero_length_cid(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
     let cid_generator_factory: fn() -> Box<dyn ConnectionIdGenerator> =
         || Box::new(RandomConnectionIdGenerator::new(0));
@@ -1262,9 +1625,9 @@ fn zero_length_cid() {
             connection_id_generator_factory: Arc::new(cid_generator_factory),
             ..EndpointConfig::default()
         }),
-        server_config(),
+        Arc::new(sprovider.server_config()),
     );
-    let (client_ch, server_ch) = pair.connect();
+    let (client_ch, server_ch) = pair.connect(cprovider);
     // Ensure we can reconnect after a previous connection is cleaned up
     info!("closing");
     pair.client
@@ -1278,11 +1641,16 @@ fn zero_length_cid() {
         .get_mut(&server_ch)
         .unwrap()
         .close(pair.time, VarInt(42), Bytes::new());
-    pair.connect();
+    pair.connect(cprovider);
 }
 
-#[test]
-fn keep_alive() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn keep_alive(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
     const IDLE_TIMEOUT: u64 = 10;
     let server = ServerConfig {
@@ -1291,10 +1659,10 @@ fn keep_alive() {
             max_idle_timeout: Some(VarInt(IDLE_TIMEOUT)),
             ..TransportConfig::default()
         }),
-        ..server_config()
+        ..sprovider.server_config()
     };
-    let mut pair = Pair::new(Default::default(), server);
-    let (client_ch, server_ch) = pair.connect();
+    let mut pair = Pair::new(Default::default(), Arc::new(server));
+    let (client_ch, server_ch) = pair.connect(cprovider);
     // Run a good while longer than the idle timeout
     let end = pair.time + Duration::from_millis(20 * IDLE_TIMEOUT);
     while pair.time < end {
@@ -1308,8 +1676,13 @@ fn keep_alive() {
     }
 }
 
-#[test]
-fn cid_rotation() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn cid_rotation(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
     const CID_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -1322,12 +1695,12 @@ fn cid_rotation() {
             connection_id_generator_factory: Arc::new(cid_generator_factory),
             ..EndpointConfig::default()
         }),
-        Some(Arc::new(server_config())),
+        Some(Arc::new(sprovider.server_config())),
     );
     let client = Endpoint::new(Arc::new(EndpointConfig::default()), None);
 
     let mut pair = Pair::new_from_endpoint(client, server);
-    let (_, server_ch) = pair.connect();
+    let (_, server_ch) = pair.connect(cprovider);
 
     let mut round: u64 = 1;
     let mut stop = pair.time;
@@ -1366,11 +1739,16 @@ fn cid_rotation() {
     }
 }
 
-#[test]
-fn cid_retirement() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn cid_retirement(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
-    let mut pair = Pair::default();
-    let (client_ch, server_ch) = pair.connect();
+    let mut pair = Pair::for_provider(sprovider);
+    let (client_ch, server_ch) = pair.connect(cprovider);
 
     // Server retires current active remote CIDs
     pair.server_conn_mut(server_ch)
@@ -1400,11 +1778,16 @@ fn cid_retirement() {
     );
 }
 
-#[test]
-fn finish_stream_flow_control_reordered() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn finish_stream_flow_control_reordered(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
-    let mut pair = Pair::default();
-    let (client_ch, server_ch) = pair.connect();
+    let mut pair = Pair::for_provider(sprovider);
+    let (client_ch, server_ch) = pair.connect(cprovider);
 
     let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
 
@@ -1448,11 +1831,16 @@ fn finish_stream_flow_control_reordered() {
     let _ = chunks.finalize();
 }
 
-#[test]
-fn handshake_1rtt_handling() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn handshake_1rtt_handling(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
-    let mut pair = Pair::default();
-    let client_ch = pair.begin_connect(client_config());
+    let mut pair = Pair::for_provider(sprovider);
+    let client_ch = pair.begin_connect(cprovider.client_config());
     pair.drive_client();
     pair.drive_server();
     let server_ch = pair.server.assert_accept();
@@ -1483,11 +1871,16 @@ fn handshake_1rtt_handling() {
     let _ = chunks.finalize();
 }
 
-#[test]
-fn stop_before_finish() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn stop_before_finish(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
-    let mut pair = Pair::default();
-    let (client_ch, server_ch) = pair.connect();
+    let mut pair = Pair::for_provider(sprovider);
+    let (client_ch, server_ch) = pair.connect(cprovider);
 
     let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
     const MSG: &[u8] = b"hello";
@@ -1505,11 +1898,16 @@ fn stop_before_finish() {
     );
 }
 
-#[test]
-fn stop_during_finish() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn stop_during_finish(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
-    let mut pair = Pair::default();
-    let (client_ch, server_ch) = pair.connect();
+    let mut pair = Pair::for_provider(sprovider);
+    let (client_ch, server_ch) = pair.connect(cprovider);
 
     let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
     const MSG: &[u8] = b"hello";
@@ -1530,11 +1928,16 @@ fn stop_during_finish() {
 }
 
 // Ensure we can recover from loss of tail packets when the congestion window is full
-#[test]
-fn congested_tail_loss() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn congested_tail_loss(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
-    let mut pair = Pair::default();
-    let (client_ch, _) = pair.connect();
+    let mut pair = Pair::for_provider(sprovider);
+    let (client_ch, _) = pair.connect(cprovider);
 
     const TARGET: u64 = 2048;
     assert!(pair.client_conn_mut(client_ch).congestion_window() > TARGET);
@@ -1554,11 +1957,16 @@ fn congested_tail_loss() {
     pair.client_send(client_ch, s).write(&[42; 1024]).unwrap();
 }
 
-#[test]
-fn datagram_send_recv() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn datagram_send_recv(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
-    let mut pair = Pair::default();
-    let (client_ch, server_ch) = pair.connect();
+    let mut pair = Pair::for_provider(sprovider);
+    let (client_ch, server_ch) = pair.connect(cprovider);
     assert_matches!(pair.server_conn_mut(server_ch).poll(), None);
     assert_matches!(pair.client_datagrams(client_ch).max_size(), Some(x) if x > 0);
 
@@ -1573,8 +1981,13 @@ fn datagram_send_recv() {
     assert_matches!(pair.server_datagrams(server_ch).recv(), None);
 }
 
-#[test]
-fn datagram_recv_buffer_overflow() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn datagram_recv_buffer_overflow(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
     const WINDOW: usize = 100;
     let server = ServerConfig {
@@ -1582,10 +1995,10 @@ fn datagram_recv_buffer_overflow() {
             datagram_receive_buffer_size: Some(WINDOW),
             ..TransportConfig::default()
         }),
-        ..server_config()
+        ..sprovider.server_config()
     };
-    let mut pair = Pair::new(Default::default(), server);
-    let (client_ch, server_ch) = pair.connect();
+    let mut pair = Pair::new(Default::default(), Arc::new(server));
+    let (client_ch, server_ch) = pair.connect(cprovider);
     assert_matches!(pair.server_conn_mut(server_ch).poll(), None);
     assert_eq!(
         pair.client_conn_mut(client_ch).datagrams().max_size(),
@@ -1613,18 +2026,23 @@ fn datagram_recv_buffer_overflow() {
     assert_matches!(pair.server_datagrams(server_ch).recv(), None);
 }
 
-#[test]
-fn datagram_unsupported() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn datagram_unsupported(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
     let server = ServerConfig {
         transport: Arc::new(TransportConfig {
             datagram_receive_buffer_size: None,
             ..TransportConfig::default()
         }),
-        ..server_config()
+        ..sprovider.server_config()
     };
-    let mut pair = Pair::new(Default::default(), server);
-    let (client_ch, server_ch) = pair.connect();
+    let mut pair = Pair::new(Default::default(), Arc::new(server));
+    let (client_ch, server_ch) = pair.connect(cprovider);
     assert_matches!(pair.server_conn_mut(server_ch).poll(), None);
     assert_matches!(pair.client_datagrams(client_ch).max_size(), None);
 
@@ -1635,20 +2053,21 @@ fn datagram_unsupported() {
     }
 }
 
-#[test]
-fn large_initial() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn large_initial(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
-    let mut server_crypto = server_crypto();
-    server_crypto.alpn_protocols = vec![vec![0, 0, 0, 42]];
-    let server_config = ServerConfig::with_crypto(Arc::new(server_crypto));
+    let server_config = sprovider.server_config_with_alpn_protocols(vec![vec![0, 0, 0, 42]]);
 
-    let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
-    let mut client_crypto = client_crypto();
+    let mut pair = Pair::new(Arc::new(EndpointConfig::default()), Arc::new(server_config));
     let protocols = (0..1000u32)
         .map(|x| x.to_be_bytes().to_vec())
         .collect::<Vec<_>>();
-    client_crypto.alpn_protocols = protocols;
-    let cfg = ClientConfig::new(Arc::new(client_crypto));
+    let cfg = cprovider.client_config_with_alpn_protocols(protocols);
     let client_ch = pair.begin_connect(cfg);
     pair.drive();
     let server_ch = pair.server.assert_accept();
@@ -1670,13 +2089,18 @@ fn large_initial() {
     );
 }
 
-#[test]
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
 /// Ensure that we don't yield a finish event before the actual FIN is acked so the peer isn't left
 /// hanging
-fn finish_acked() {
+fn finish_acked(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
-    let mut pair = Pair::default();
-    let (client_ch, server_ch) = pair.connect();
+    let mut pair = Pair::for_provider(sprovider);
+    let (client_ch, server_ch) = pair.connect(cprovider);
 
     let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
 
@@ -1726,12 +2150,17 @@ fn finish_acked() {
     let _ = chunks.finalize();
 }
 
-#[test]
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
 /// Ensure that we don't yield a finish event while there's still unacknowledged data
-fn finish_retransmit() {
+fn finish_retransmit(cprovider: Provider, sprovider: Provider) {
     let _guard = subscribe();
-    let mut pair = Pair::default();
-    let (client_ch, server_ch) = pair.connect();
+    let mut pair = Pair::for_provider(sprovider);
+    let (client_ch, server_ch) = pair.connect(cprovider);
 
     let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
 
@@ -1775,18 +2204,25 @@ fn finish_retransmit() {
 
 /// Ensures that exchanging data on a client-initiated bidirectional stream works past the initial
 /// stream window.
-#[test]
-fn repeated_request_response() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn repeated_request_response(cprovider: Provider, sprovider: Provider) {
+    // let cprovider = Provider::Boring;
+    // let sprovider = Provider::Boring;
     let _guard = subscribe();
     let server = ServerConfig {
         transport: Arc::new(TransportConfig {
             max_concurrent_bidi_streams: 1u32.into(),
             ..TransportConfig::default()
         }),
-        ..server_config()
+        ..sprovider.server_config()
     };
-    let mut pair = Pair::new(Default::default(), server);
-    let (client_ch, server_ch) = pair.connect();
+    let mut pair = Pair::new(Default::default(), Arc::new(server));
+    let (client_ch, server_ch) = pair.connect(cprovider);
     const REQUEST: &[u8] = b"hello";
     const RESPONSE: &[u8] = b"world";
     for _ in 0..3 {
@@ -1824,14 +2260,21 @@ fn repeated_request_response() {
 }
 
 /// Ensures that the client sends an anti-deadlock probe after an incomplete server's first flight
-#[test]
-fn handshake_anti_deadlock_probe() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn handshake_anti_deadlock_probe(cprovider: Provider, sprovider: Provider) {
+    // let cprovider = Provider::Boring;
+    // let sprovider = Provider::Boring;
     let _guard = subscribe();
 
-    let (cert, key) = big_cert_and_key();
-    let server = server_config_with_cert(cert.clone(), key);
-    let client = client_config_with_certs(vec![cert]);
-    let mut pair = Pair::new(Default::default(), server);
+    let cert_and_key = big_cert_and_key();
+    let server = sprovider.server_config_with_cert(&cert_and_key);
+    let client = cprovider.client_config_with_cert(cert_and_key.cert_chain());
+    let mut pair = Pair::new(Default::default(), Arc::new(server));
 
     let client_ch = pair.begin_connect(client);
     // Client sends initial
@@ -1856,14 +2299,21 @@ fn handshake_anti_deadlock_probe() {
 
 /// Ensures that the server can respond with 3 initial packets during the handshake
 /// before the anti-amplification limit kicks in when MTUs are similar.
-#[test]
-fn server_can_send_3_inital_packets() {
+#[parameterized(
+rustls = { Provider::Rustls, Provider::Rustls },
+boring = { Provider::Boring, Provider::Boring },
+rustls_to_boring = { Provider::Rustls, Provider::Boring },
+boring_to_rustls = { Provider::Boring, Provider::Rustls },
+)]
+fn server_can_send_3_inital_packets(cprovider: Provider, sprovider: Provider) {
+    // let cprovider = Provider::Boring;
+    // let sprovider = Provider::Boring;
     let _guard = subscribe();
 
-    let (cert, key) = big_cert_and_key();
-    let server = server_config_with_cert(cert.clone(), key);
-    let client = client_config_with_certs(vec![cert]);
-    let mut pair = Pair::new(Default::default(), server);
+    let cert_and_key = big_cert_and_key();
+    let server = sprovider.server_config_with_cert(&cert_and_key);
+    let client = cprovider.client_config_with_cert(cert_and_key.cert_chain());
+    let mut pair = Pair::new(Default::default(), Arc::new(server));
 
     let client_ch = pair.begin_connect(client);
     // Client sends initial
@@ -1885,24 +2335,29 @@ fn server_can_send_3_inital_packets() {
 }
 
 /// Generate a big fat certificate that can't fit inside the initial anti-amplification limit
-fn big_cert_and_key() -> (rustls::Certificate, rustls::PrivateKey) {
-    let cert = rcgen::generate_simple_self_signed(
+fn big_cert_and_key() -> CertAndKey {
+    gen_cert(
         Some("localhost".into())
             .into_iter()
             .chain((0..1000).map(|x| format!("foo_{}", x)))
             .collect::<Vec<_>>(),
+        &CA,
     )
-    .unwrap();
-    let key = rustls::PrivateKey(cert.serialize_private_key_der());
-    let cert = rustls::Certificate(cert.serialize_der().unwrap());
-    (cert, key)
 }
 
-#[test]
-fn malformed_token_len() {
+#[parameterized(
+rustls = { Provider::Rustls },
+boring = { Provider::Boring },
+)]
+fn malformed_token_len(sprovider: Provider) {
+    // let cprovider = Provider::Boring;
+    // let sprovider = Provider::Boring;
     let _guard = subscribe();
     let client_addr = "[::2]:7890".parse().unwrap();
-    let mut server = Endpoint::new(Default::default(), Some(Arc::new(server_config())));
+    let mut server = Endpoint::new(
+        Default::default(),
+        Some(Arc::new(sprovider.server_config())),
+    );
     server.handle(
         Instant::now(),
         client_addr,

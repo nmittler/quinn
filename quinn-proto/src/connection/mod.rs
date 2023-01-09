@@ -2164,7 +2164,7 @@ impl Connection {
                 }
 
                 if self.side.is_client() {
-                    // Client-only beceause server params were set from the client's Initial
+                    // Client-only because server params were set from the client's Initial
                     let params =
                         self.crypto
                             .transport_parameters()?

@@ -14,7 +14,7 @@ use bytes::BytesMut;
 
 use crate::{
     shared::ConnectionId, transport_parameters::TransportParameters, ConnectError, Side,
-    TransportError,
+    TransportError, TransportErrorCode
 };
 
 /// Cryptography interface based on *ring*
@@ -23,6 +23,12 @@ pub(crate) mod ring;
 /// TLS interface based on rustls
 #[cfg(feature = "rustls")]
 pub mod rustls;
+/// TLS interface for BoringSSL.
+// #[cfg(feature = "boring")]
+pub mod boring;
+/// Cryptography interface for BoringSSL (based on code borrowed from quiche).
+
+// pub(crate) mod quiche;
 
 /// A cryptographic session (commonly TLS)
 pub trait Session: Send + 'static {
@@ -56,7 +62,8 @@ pub trait Session: Send + 'static {
     ///
     /// This should be called with the contents of `CRYPTO` frames. If it returns `Ok`, the
     /// caller should call `write_handshake()` to check if the crypto protocol has anything
-    /// to send to the peer.
+    /// to send to the peer. This method will only return `true` the first time that
+    /// handshake data is available. Future calls will always return false.
     ///
     /// On success, returns `true` iff `self.handshake_data()` has been populated.
     fn read_handshake(&mut self, buf: &[u8]) -> Result<bool, TransportError>;
@@ -117,6 +124,9 @@ pub trait ClientConfig: Send + Sync {
         server_name: &str,
         params: &TransportParameters,
     ) -> Result<Box<dyn Session>, ConnectError>;
+
+    /// Returns Self for use in down-casting to extract implementation details.
+    fn as_any(&self) -> &dyn Any;
 }
 
 /// Server-side configuration for the crypto protocol
@@ -142,6 +152,9 @@ pub trait ServerConfig: Send + Sync {
         version: u32,
         params: &TransportParameters,
     ) -> Box<dyn Session>;
+
+    /// Returns Self for use in down-casting to extract implementation details
+    fn as_any(&self) -> &dyn Any;
 }
 
 /// Keys used to protect packet payloads

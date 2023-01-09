@@ -11,6 +11,7 @@ use crate::{
     crypto::{self, HandshakeTokenKey, HmacKey},
     VarInt, VarIntBoundsExceeded, DEFAULT_SUPPORTED_VERSIONS, INITIAL_MAX_UDP_PAYLOAD_SIZE,
 };
+use crate::crypto::boring::QuicSslContext;
 
 /// Parameters governing the core QUIC state machine
 ///
@@ -435,6 +436,13 @@ impl Default for EndpointConfig {
     }
 }
 
+#[cfg(all(not(feature = "ring"), feature="tls-boring"))]
+impl Default for EndpointConfig {
+    fn default() -> Self {
+        Self::new(Arc::new(crypto::boring::HmacKey::sha256()))
+    }
+}
+
 /// Parameters governing incoming connections
 ///
 /// Default values should be suitable for most internet applications.
@@ -559,6 +567,31 @@ impl ServerConfig {
         let master_key = ring::hkdf::Salt::new(ring::hkdf::HKDF_SHA256, &[]).extract(&master_key);
 
         Self::new(crypto, Arc::new(master_key))
+    }
+}
+
+#[cfg(feature = "boring")]
+impl ServerConfig {
+    /// Create a server config with the given BoringSSL certificate chain to be presented to clients
+    ///
+    /// Uses a randomized handshake token key.
+    pub fn with_single_cert_boring(
+        cert_chain: Vec<boring::x509::X509>,
+        key: boring::pkey::PKey<boring::pkey::Private>,
+    ) -> crypto::boring::Result<Self> {
+        let mut cfg = crypto::boring::ServerConfig::new()?;
+        cfg.ctx.set_cert_chain(cert_chain)?;
+        cfg.ctx.set_private_key(key.as_ref())?;
+        cfg.ctx.check_private_key()?;
+        Ok(Self::with_crypto_boring(Arc::new(cfg)))
+    }
+
+    /// Create a server config with the given [`crypto::boring::Config`]
+    ///
+    /// Uses a randomized handshake token key.
+    pub fn with_crypto_boring(crypto: Arc<crypto::boring::ServerConfig>) -> Self {
+        let token_key = crypto::boring::HandshakeTokenKey::new().unwrap();
+        Self::new(crypto, Arc::new(token_key))
     }
 }
 
